@@ -51,12 +51,16 @@ import android.view.WindowManager;
 import androidx.annotation.NonNull;
 import androidx.core.app.NotificationCompat;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import io.reactivex.rxjava3.core.Observable;
 import io.reactivex.rxjava3.subjects.BehaviorSubject;
@@ -245,24 +249,41 @@ public class MainService extends Service {
                 Intent mediaProjectionRequestIntent = new Intent(this, MediaProjectionRequestActivity.class);
                 mediaProjectionRequestIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(mediaProjectionRequestIntent);
+                if (hasRoot()) autoApproveMediaProjectionDialog();
             }
         }
 
         if(ACTION_HANDLE_INPUT_RESULT.equals(intent.getAction())) {
             Log.d(TAG, "onStartCommand: handle input result");
-            // Step 2: coming back from input permission check, now setup InputService and ask for write storage permission
+            // Step 2: setup InputService scaling, then ask for write storage (or skip if root)
             InputService.setScaling(PreferenceManager.getDefaultSharedPreferences(this).getFloat(Constants.PREFS_KEY_SETTINGS_SCALING, Constants.DEFAULT_SCALING));
-            Intent writeStorageRequestIntent = new Intent(this, WriteStorageRequestActivity.class);
-            writeStorageRequestIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(writeStorageRequestIntent);
+            if (hasRoot()) {
+                Log.i(TAG, "onStartCommand: root available, skipping write storage dialog");
+                Intent skipStorage = new Intent(this, MainService.class);
+                skipStorage.setAction(ACTION_HANDLE_WRITE_STORAGE_RESULT);
+                skipStorage.putExtra(EXTRA_WRITE_STORAGE_RESULT, true);
+                startService(skipStorage);
+            } else {
+                Intent writeStorageRequestIntent = new Intent(this, WriteStorageRequestActivity.class);
+                writeStorageRequestIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(writeStorageRequestIntent);
+            }
         }
 
         if(ACTION_START.equals(intent.getAction())) {
             Log.d(TAG, "onStartCommand: start");
-            // Step 1: check input permission
-            Intent inputRequestIntent = new Intent(this, InputRequestActivity.class);
-            inputRequestIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(inputRequestIntent);
+            // Step 1: check input permission (skip if root — setting persists across reboots)
+            if (hasRoot()) {
+                Log.i(TAG, "onStartCommand: root available, skipping input permission dialog");
+                Intent skipInput = new Intent(this, MainService.class);
+                skipInput.setAction(ACTION_HANDLE_INPUT_RESULT);
+                skipInput.putExtra(EXTRA_INPUT_RESULT, true);
+                startService(skipInput);
+            } else {
+                Intent inputRequestIntent = new Intent(this, InputRequestActivity.class);
+                inputRequestIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(inputRequestIntent);
+            }
         }
 
         if(ACTION_STOP.equals(intent.getAction())) {
@@ -550,5 +571,105 @@ public class MainService extends Service {
         catch (NullPointerException e) {
             return false;
         }
+    }
+
+
+    // ── Root helpers ──────────────────────────────────────────────────────────
+
+    private static Boolean sHasRoot = null;
+
+    private static boolean hasRoot() {
+        if (sHasRoot != null) return sHasRoot;
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "echo ok"});
+            sHasRoot = (p.waitFor() == 0);
+        } catch (Exception e) {
+            sHasRoot = false;
+        }
+        Log.i(TAG, "hasRoot: " + sHasRoot);
+        return sHasRoot;
+    }
+
+    private static void autoApproveMediaProjectionDialog() {
+        new Thread(() -> {
+            Log.i(TAG, "autoApprove: waiting for MediaProjection dialog...");
+            for (int i = 0; i < 30; i++) {
+                try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+                try {
+                    // Wake screen so uiautomator can dump the UI
+                    Runtime.getRuntime().exec(new String[]{"su", "-c", "input keyevent KEYCODE_WAKEUP"}).waitFor();
+
+                    // Check if MediaProjection dialog is the current foreground activity
+                    Process actProc = Runtime.getRuntime().exec(
+                            new String[]{"su", "-c", "dumpsys activity top 2>/dev/null | grep ACTIVITY | tail -1"});
+                    BufferedReader actBr = new BufferedReader(new InputStreamReader(actProc.getInputStream()));
+                    String actLine = actBr.readLine();
+                    actProc.waitFor();
+                    boolean dialogVisible = actLine != null && actLine.contains("MediaProjectionPermission");
+                    Log.d(TAG, "autoApprove[" + i + "]: foreground=" + actLine);
+
+                    if (dialogVisible) {
+                        // Try uiautomator dump first for precise coordinates
+                        Process dump = Runtime.getRuntime().exec(
+                                new String[]{"su", "-c", "uiautomator dump /sdcard/mp_ui.xml && cat /sdcard/mp_ui.xml"});
+                        BufferedReader br = new BufferedReader(new InputStreamReader(dump.getInputStream()));
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = br.readLine()) != null) sb.append(line);
+                        dump.waitFor();
+                        String ui = sb.toString();
+
+                        String tap = findTapByResourceId(ui, "android:id/button1");
+                        if (tap == null) tap = findTapByKeyword(ui, "Comenzar", "Start now", "Iniciar", "OK");
+                        if (tap != null) {
+                            Runtime.getRuntime().exec(new String[]{"su", "-c", "input tap " + tap}).waitFor();
+                            Log.i(TAG, "autoApprove: tapped confirm at " + tap);
+                            return;
+                        }
+                        // Fallback: press ENTER to activate the focused (positive) button
+                        Log.w(TAG, "autoApprove: uiautomator failed, pressing ENTER");
+                        Runtime.getRuntime().exec(new String[]{"su", "-c", "input keyevent KEYCODE_ENTER"}).waitFor();
+                        return;
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "autoApprove: " + e);
+                }
+            }
+            Log.w(TAG, "autoApprove: dialog never appeared");
+        }).start();
+    }
+
+    // bounds format in uiautomator XML: bounds="[x1,y1][x2,y2]"
+    private static final Pattern BOUNDS = Pattern.compile("\\[(\\d+),(\\d+)]\\[(\\d+),(\\d+)]");
+
+    private static String findTapByResourceId(String xml, String id) {
+        int idx = xml.indexOf("resource-id=\"" + id + "\"");
+        if (idx < 0) return null;
+        int boundsIdx = xml.indexOf("bounds=\"", idx);
+        if (boundsIdx < 0) return null;
+        int end = xml.indexOf("\"", boundsIdx + 8);
+        return boundsCenter(xml.substring(boundsIdx + 8, end));
+    }
+
+    private static String findTapByKeyword(String xml, String... keywords) {
+        for (String kw : keywords) {
+            int idx = xml.indexOf("text=\"" + kw);
+            if (idx < 0) idx = xml.indexOf("content-desc=\"" + kw);
+            if (idx < 0) continue;
+            int boundsIdx = xml.indexOf("bounds=\"", idx);
+            if (boundsIdx < 0) continue;
+            int end = xml.indexOf("\"", boundsIdx + 8);
+            String result = boundsCenter(xml.substring(boundsIdx + 8, end));
+            if (result != null) return result;
+        }
+        return null;
+    }
+
+    private static String boundsCenter(String bounds) {
+        Matcher m = BOUNDS.matcher(bounds);
+        if (!m.find()) return null;
+        int cx = (Integer.parseInt(m.group(1)) + Integer.parseInt(m.group(3))) / 2;
+        int cy = (Integer.parseInt(m.group(2)) + Integer.parseInt(m.group(4))) / 2;
+        return cx + " " + cy;
     }
 }

@@ -12,302 +12,264 @@ package net.christianbeier.droidvnc_ng;
  *
  * Swipe fixes and gesture handling by Christian Beier <info@christianbeier.net>.
  *
+ * Root-based input fallback for API < 24 by alexbrtz.
  */
 
 import android.accessibilityservice.AccessibilityService;
-import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.os.Build;
 import android.os.Handler;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
-import android.view.ViewConfiguration;
-import android.graphics.Path;
+
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
 
 public class InputService extends AccessibilityService {
 
-	/**
-	 * This globally tracks gesture completion status and is _not_ per gesture.
-	 */
-	private static class GestureCallback extends AccessibilityService.GestureResultCallback {
-		private boolean mCompleted = true; // initially true so we can actually dispatch something
+    private static final String TAG = "InputService";
 
-		@Override
-		public synchronized void onCompleted(GestureDescription gestureDescription) {
-			mCompleted = true;
-		}
+    private static InputService instance;
 
-		@Override
-		public synchronized void onCancelled(GestureDescription gestureDescription) {
-			mCompleted = true;
-		}
-	}
+    private Handler mMainHandler;
 
-	private static final String TAG = "InputService";
+    private boolean mIsButtonOneDown;
 
-	private static InputService instance;
+    private boolean mIsKeyCtrlDown;
+    private boolean mIsKeyAltDown;
+    private boolean mIsKeyShiftDown;
+    private boolean mIsKeyDelDown;
+    private boolean mIsKeyEscDown;
 
-	private Handler mMainHandler;
+    private float mScaling;
 
-	private boolean mIsButtonOneDown;
-	private Path mPath;
-	private long mLastGestureStartTime;
+    /** API 24+ gesture dispatcher — null on API 23 */
+    private GestureHelper mGestureHelper;
 
-	private boolean mIsKeyCtrlDown;
-	private boolean mIsKeyAltDown;
-	private boolean mIsKeyShiftDown;
-	private boolean mIsKeyDelDown;
-	private boolean mIsKeyEscDown;
+    /** Root-path gesture tracking — static so it works without service binding */
+    private static float sScaling = 1.0f;
+    private static boolean sIsButtonOneDown = false;
+    private static int sRootStartX, sRootStartY;
+    private static long sLastGestureStartTime;
 
-	private float mScaling;
+    /** Persistent root shell — must be declared before sHasRoot */
+    private static Process      sSuShell;
+    private static PrintWriter  sSuWriter;
+    private static final Object sSuLock = new Object();
 
-	private final GestureCallback mGestureCallback = new GestureCallback();
+    /** Whether root shell access is available (checked once at startup) */
+    private static boolean sHasRoot = checkRoot();
 
 
-	@Override
-	public void onAccessibilityEvent( AccessibilityEvent event ) { }
+    // ── AccessibilityService lifecycle ────────────────────────────────────────
 
-	@Override
-	public void onInterrupt() { }
+    @Override
+    public void onAccessibilityEvent(AccessibilityEvent event) {}
 
-	@Override
-	public void onServiceConnected()
-	{
-		super.onServiceConnected();
-		instance = this;
-		mMainHandler = new Handler(instance.getMainLooper());
-		Log.i(TAG, "onServiceConnected");
-	}
+    @Override
+    public void onInterrupt() {}
 
-	@Override
-	public void onDestroy() {
-		super.onDestroy();
-		instance = null;
-		Log.i(TAG, "onDestroy");
-	}
+    @Override
+    public void onServiceConnected() {
+        super.onServiceConnected();
+        instance = this;
+        mMainHandler = new Handler(instance.getMainLooper());
 
-	public static boolean isEnabled()
-	{
-		return instance != null;
-	}
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            mGestureHelper = new GestureHelper(this);
+            Log.i(TAG, "onServiceConnected: using GestureDescription (API 24+)");
+        } else {
+            Log.i(TAG, "onServiceConnected: API 23, root=" + sHasRoot);
+        }
+    }
 
-	/**
-	 * Set scaling factor that's applied to incoming pointer events by dividing coordinates by
-	 * the given factor.
-	 * @param scaling The scaling factor as a real number.
-	 * @return Whether scaling was applied or not.
-	 */
-	public static boolean setScaling(float scaling) {
-		try {
-			instance.mScaling = scaling;
-			return true;
-		} catch (Exception e) {
-			return false;
-		}
-	}
-
-	@SuppressWarnings("unused")
-	public static void onPointerEvent(int buttonMask, int x, int y, long client) {
-
-		try {
-			x /= instance.mScaling;
-			y /= instance.mScaling;
-
-			/*
-			    left mouse button
-			 */
-
-			// down, was up
-			if ((buttonMask & (1 << 0)) != 0 && !instance.mIsButtonOneDown) {
-				instance.mIsButtonOneDown = true;
-				instance.startGesture(x, y);
-			}
-
-			// down, was down
-			if ((buttonMask & (1 << 0)) != 0 && instance.mIsButtonOneDown) {
-				instance.continueGesture(x, y);
-			}
-
-			// up, was down
-			if ((buttonMask & (1 << 0)) == 0 && instance.mIsButtonOneDown) {
-				instance.mIsButtonOneDown = false;
-				instance.endGesture(x, y);
-			}
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        instance = null;
+        Log.i(TAG, "onDestroy");
+    }
 
 
-			// right mouse button
-			if ((buttonMask & (1 << 2)) != 0) {
-				instance.longPress(x, y);
-			}
+    // ── Public API ────────────────────────────────────────────────────────────
 
-			// scroll up
-			if ((buttonMask & (1 << 3)) != 0) {
+    public static boolean isEnabled() {
+        return instance != null;
+    }
 
-				DisplayMetrics displayMetrics = new DisplayMetrics();
-				WindowManager wm = (WindowManager) instance.getApplicationContext().getSystemService(Context.WINDOW_SERVICE);
-				wm.getDefaultDisplay().getRealMetrics(displayMetrics);
+    public static boolean setScaling(float scaling) {
+        sScaling = scaling;
+        if (instance != null) instance.mScaling = scaling;
+        return true;
+    }
 
-				instance.scroll(x, y, -displayMetrics.heightPixels / 2);
-			}
+    @SuppressWarnings("unused")
+    public static void onPointerEvent(int buttonMask, int x, int y, long client) {
+        try {
+            // API 23 root path: works even without service binding
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+                x /= sScaling;
+                y /= sScaling;
 
-			// scroll down
-			if ((buttonMask & (1 << 4)) != 0) {
+                if ((buttonMask & (1 << 0)) != 0 && !sIsButtonOneDown) {
+                    sIsButtonOneDown = true;
+                    sRootStartX = x; sRootStartY = y;
+                    sLastGestureStartTime = System.currentTimeMillis();
+                }
+                if ((buttonMask & (1 << 0)) == 0 && sIsButtonOneDown) {
+                    sIsButtonOneDown = false;
+                    long duration = System.currentTimeMillis() - sLastGestureStartTime;
+                    if (sRootStartX == x && sRootStartY == y) {
+                        execRoot("input tap " + x + " " + y);
+                    } else {
+                        execRoot("input swipe " + sRootStartX + " " + sRootStartY
+                                + " " + x + " " + y + " " + Math.max(duration, 1));
+                    }
+                }
+                if ((buttonMask & (1 << 2)) != 0) {
+                    execRoot("input swipe " + x + " " + y + " " + x + " " + y + " 600");
+                }
+                if ((buttonMask & (1 << 3)) != 0) {
+                    execRoot("input swipe " + x + " " + y + " " + x + " " + Math.max(y - 400, 0) + " 300");
+                }
+                if ((buttonMask & (1 << 4)) != 0) {
+                    execRoot("input swipe " + x + " " + y + " " + x + " " + (y + 400) + " 300");
+                }
+                return;
+            }
 
-				DisplayMetrics displayMetrics = new DisplayMetrics();
-				WindowManager wm = (WindowManager) instance.getApplicationContext().getSystemService(Context.WINDOW_SERVICE);
-				wm.getDefaultDisplay().getRealMetrics(displayMetrics);
+            // API 24+ path: needs service instance for GestureDescription
+            if (instance == null) return;
 
-				instance.scroll(x, y, displayMetrics.heightPixels / 2);
-			}
-		} catch (Exception e) {
-			// instance probably null
-			Log.e(TAG, "onPointerEvent: failed: " + Log.getStackTraceString(e));
-		}
-	}
+            x /= instance.mScaling;
+            y /= instance.mScaling;
 
-	public static void onKeyEvent(int down, long keysym, long client) {
-		Log.d(TAG, "onKeyEvent: keysym " + keysym + " down " + down + " by client " + client);
+            if ((buttonMask & (1 << 0)) != 0 && !instance.mIsButtonOneDown) {
+                instance.mIsButtonOneDown = true;
+                instance.startGesture(x, y);
+            }
+            if ((buttonMask & (1 << 0)) != 0 && instance.mIsButtonOneDown) {
+                instance.continueGesture(x, y);
+            }
+            if ((buttonMask & (1 << 0)) == 0 && instance.mIsButtonOneDown) {
+                instance.mIsButtonOneDown = false;
+                instance.endGesture(x, y);
+            }
+            if ((buttonMask & (1 << 2)) != 0) {
+                instance.longPress(x, y);
+            }
+            if ((buttonMask & (1 << 3)) != 0 || (buttonMask & (1 << 4)) != 0) {
+                DisplayMetrics dm = new DisplayMetrics();
+                ((WindowManager) instance.getApplicationContext()
+                        .getSystemService(Context.WINDOW_SERVICE))
+                        .getDefaultDisplay().getRealMetrics(dm);
+                int amount = (buttonMask & (1 << 3)) != 0
+                        ? -dm.heightPixels / 2 : dm.heightPixels / 2;
+                instance.scroll(x, y, amount);
+            }
 
-		/*
-			Special key handling.
-		 */
-		try {
-			/*
-				Save states of some keys for combo handling.
-			 */
-			if(keysym == 0xFFE3)
-				instance.mIsKeyCtrlDown = down != 0;
+        } catch (Exception e) {
+            Log.e(TAG, "onPointerEvent: failed: " + Log.getStackTraceString(e));
+        }
+    }
 
-			if(keysym == 0xFFE9 || keysym == 0xFF7E) // MacOS clients send Alt as 0xFF7E
-				instance.mIsKeyAltDown = down != 0;
+    public static void onKeyEvent(int down, long keysym, long client) {
+        Log.d(TAG, "onKeyEvent: keysym " + keysym + " down " + down + " by client " + client);
+        try {
+            if (keysym == 0xFFE3) instance.mIsKeyCtrlDown  = down != 0;
+            if (keysym == 0xFFE9 || keysym == 0xFF7E) instance.mIsKeyAltDown  = down != 0;
+            if (keysym == 0xFFE1) instance.mIsKeyShiftDown = down != 0;
+            if (keysym == 0xFFFF) instance.mIsKeyDelDown   = down != 0;
+            if (keysym == 0xFF1B) instance.mIsKeyEscDown   = down != 0;
 
-			if(keysym == 0xFFE1)
-				instance.mIsKeyShiftDown = down != 0;
+            if (instance.mIsKeyCtrlDown && instance.mIsKeyAltDown && instance.mIsKeyDelDown) {
+                Log.i(TAG, "onKeyEvent: got Ctrl-Alt-Del");
+                instance.mMainHandler.post(MainService::togglePortraitInLandscapeWorkaround);
+            }
 
-			if(keysym == 0xFFFF)
-				instance.mIsKeyDelDown = down != 0;
+            if (instance.mIsKeyCtrlDown && instance.mIsKeyShiftDown && instance.mIsKeyEscDown) {
+                Log.i(TAG, "onKeyEvent: got Ctrl-Shift-Esc");
+                instance.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS);
+            }
 
-			if(keysym == 0xFF1B)
-				instance.mIsKeyEscDown = down != 0;
+            if (keysym == 0xFF50 && down != 0) {
+                instance.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME);
+            }
 
-			/*
-				Ctrl-Alt-Del combo.
-		 	*/
-			if(instance.mIsKeyCtrlDown && instance.mIsKeyAltDown && instance.mIsKeyDelDown) {
-				Log.i(TAG, "onKeyEvent: got Ctrl-Alt-Del");
-				instance.mMainHandler.post(MainService::togglePortraitInLandscapeWorkaround);
-			}
+            if (keysym == 0xFF1B && down != 0) {
+                instance.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK);
+            }
 
-			/*
-				Ctrl-Shift-Esc combo.
-		 	*/
-			if(instance.mIsKeyCtrlDown && instance.mIsKeyShiftDown && instance.mIsKeyEscDown) {
-				Log.i(TAG, "onKeyEvent: got Ctrl-Shift-Esc");
-				instance.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS);
-			}
+        } catch (Exception e) {
+            Log.e(TAG, "onKeyEvent: failed: " + e);
+        }
+    }
 
-			/*
-				Home/Pos1
-		 	*/
-			if (keysym == 0xFF50 && down != 0) {
-				Log.i(TAG, "onKeyEvent: got Home/Pos1");
-				instance.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME);
-			}
-
-			/*
-				Esc
-			 */
-			if(keysym == 0xFF1B && down != 0)  {
-				Log.i(TAG, "onKeyEvent: got Home/Pos1");
-				instance.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK);
-			}
-
-		} catch (Exception e) {
-			// instance probably null
-			Log.e(TAG, "onKeyEvent: failed: " + e);
-		}
-	}
-
-	public static void onCutText(String text, long client) {
-		Log.d(TAG, "onCutText: text '" + text + "' by client " + client);
-
-		try {
-			instance.mMainHandler.post(() -> ((ClipboardManager) instance.getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText(text, text)));
-		} catch (Exception e) {
-			// instance probably null
-			Log.e(TAG, "onCutText: failed: " + e);
-		}
-	}
-
-	private void startGesture(int x, int y) {
-		mPath = new Path();
-		mPath.moveTo( x, y );
-		mLastGestureStartTime = System.currentTimeMillis();
-	}
-
-	private void continueGesture(int x, int y) {
-		mPath.lineTo( x, y );
-	}
-
-	private void endGesture(int x, int y) {
-		mPath.lineTo( x, y );
-		long duration = System.currentTimeMillis() - mLastGestureStartTime;
-		// gesture ended very very shortly after start (< 1ms). make it 1ms to get dispatched to the system
-		if (duration == 0) duration = 1;
-		GestureDescription.StrokeDescription stroke = new GestureDescription.StrokeDescription( mPath, 0, duration);
-		GestureDescription.Builder builder = new GestureDescription.Builder();
-		builder.addStroke(stroke);
-		dispatchGesture(builder.build(), null, null);
-	}
+    public static void onCutText(String text, long client) {
+        Log.d(TAG, "onCutText: text '" + text + "' by client " + client);
+        try {
+            instance.mMainHandler.post(() ->
+                    ((ClipboardManager) instance.getSystemService(Context.CLIPBOARD_SERVICE))
+                            .setPrimaryClip(ClipData.newPlainText(text, text)));
+        } catch (Exception e) {
+            Log.e(TAG, "onCutText: failed: " + e);
+        }
+    }
 
 
-	private  void longPress( int x, int y )
-	{
-			dispatchGesture( createClick( x, y, ViewConfiguration.getTapTimeout() + ViewConfiguration.getLongPressTimeout()), null, null );
-	}
+    // ── Gesture dispatch (API 24+ only — root path is handled in onPointerEvent) ──
 
-	private void scroll( int x, int y, int scrollAmount )
-	{
-			/*
-			   Ignore if another gesture is still ongoing. Especially true for scroll events:
-			   These mouse button 4,5 events come per each virtual scroll wheel click, an incoming
-			   event would cancel the preceding one, only actually scrolling when the user stopped
-			   scrolling.
-			 */
-			if(!mGestureCallback.mCompleted)
-				return;
+    private void startGesture(int x, int y)    { mGestureHelper.startGesture(x, y); }
+    private void continueGesture(int x, int y) { mGestureHelper.continueGesture(x, y); }
+    private void endGesture(int x, int y)      { mGestureHelper.endGesture(x, y); }
+    private void longPress(int x, int y)       { mGestureHelper.longPress(x, y); }
+    private void scroll(int x, int y, int amt) { mGestureHelper.scroll(x, y, amt); }
 
-			mGestureCallback.mCompleted = false;
-			dispatchGesture(createSwipe(x, y, x, y - scrollAmount, ViewConfiguration.getScrollDefaultDelay()), mGestureCallback, null);
-	}
 
-	private static GestureDescription createClick( int x, int y, int duration )
-	{
-		Path clickPath = new Path();
-		clickPath.moveTo( x, y );
-		GestureDescription.StrokeDescription clickStroke = new GestureDescription.StrokeDescription( clickPath, 0, duration );
-		GestureDescription.Builder clickBuilder = new GestureDescription.Builder();
-		clickBuilder.addStroke( clickStroke );
-		return clickBuilder.build();
-	}
+    // ── Persistent root shell ─────────────────────────────────────────────────
 
-	private static GestureDescription createSwipe( int x1, int y1, int x2, int y2, int duration )
-	{
-		Path swipePath = new Path();
+    private static boolean checkRoot() {
+        synchronized (sSuLock) {
+            try {
+                sSuShell  = Runtime.getRuntime().exec("su");
+                sSuWriter = new PrintWriter(new OutputStreamWriter(sSuShell.getOutputStream()));
+                sSuWriter.println("echo ok");
+                sSuWriter.flush();
+                Log.i(TAG, "checkRoot: persistent su shell opened");
+                return true;
+            } catch (Exception e) {
+                Log.w(TAG, "checkRoot: no root available: " + e);
+                return false;
+            }
+        }
+    }
 
-		x1 = Math.max(x1, 0);
-		y1 = Math.max(y1, 0);
-		x2 = Math.max(x2, 0);
-		y2 = Math.max(y2, 0);
+    private static boolean isShellAlive() {
+        if (sSuShell == null) return false;
+        try {
+            sSuShell.exitValue();
+            return false; // exited
+        } catch (IllegalThreadStateException e) {
+            return true;  // still running
+        }
+    }
 
-		swipePath.moveTo( x1, y1 );
-		swipePath.lineTo( x2, y2 );
-		GestureDescription.StrokeDescription swipeStroke = new GestureDescription.StrokeDescription( swipePath, 0, duration );
-		GestureDescription.Builder swipeBuilder = new GestureDescription.Builder();
-		swipeBuilder.addStroke( swipeStroke );
-		return swipeBuilder.build();
-	}
+    private static void execRoot(String cmd) {
+        synchronized (sSuLock) {
+            try {
+                if (!isShellAlive()) {
+                    Log.w(TAG, "execRoot: shell died, reopening");
+                    checkRoot();
+                }
+                sSuWriter.println(cmd);
+                sSuWriter.flush();
+            } catch (Exception e) {
+                Log.e(TAG, "execRoot: failed '" + cmd + "': " + e);
+            }
+        }
+    }
 }
