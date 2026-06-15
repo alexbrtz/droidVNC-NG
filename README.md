@@ -1,91 +1,166 @@
-# droidVNC-NG
+# droidVNC-NG — Rama Android 6 con soporte root
 
-[![Join the chat at https://gitter.im/droidVNC-NG/community](https://badges.gitter.im/droidVNC-NG/community.svg)](https://gitter.im/droidVNC-NG/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+[![Únete al chat en Gitter](https://badges.gitter.im/droidVNC-NG/community.svg)](https://gitter.im/droidVNC-NG/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
-This is an Android VNC server using contemporary Android 5+ APIs. It therefore does not require
-root access. In reverence to the venerable [droid-VNC-server](https://github.com/oNaiPs/droidVncServer)
-is is called droidVNC-NG.
+Este repositorio es un fork de [bk138/droidVNC-NG](https://github.com/bk138/droidVNC-NG), un servidor VNC para Android que utiliza las APIs modernas del sistema operativo para capturar la pantalla e inyectar eventos de entrada remotos.
 
-[<img src="https://fdroid.gitlab.io/artwork/badge/get-it-on.png"
-     alt="Get it on F-Droid"
-     height="80">](https://f-droid.org/packages/net.christianbeier.droidvnc_ng/)
-[<img src="https://play.google.com/intl/en_us/badges/images/generic/en-play-badge.png"
-     alt="Get it on Google Play"
-     height="80">](https://play.google.com/store/apps/details?id=net.christianbeier.droidvnc_ng)
+La rama `android-6-root-support` extiende el proyecto original para funcionar en **dispositivos Android 6.0 (API 23)** con acceso root, eliminando por completo la necesidad de interacción del usuario al arrancar el dispositivo. Está pensada para entornos de tipo kiosco o gestión remota de dispositivos legacy.
 
-## Features
+---
 
-* Network export of device frame buffer with optional server-side scaling.
-* Injection of remote pointer events.
-* Handling of client-to-server text copy & paste. Note that server-to-client copy & paste does not
-  work in a generic way due to [Android security restrictions](https://developer.android.com/about/versions/10/privacy/changes#clipboard-data).
-* Handling of special keys to trigger 'Recent Apps' overview, Home button and Back button.
-* Android permission handling.
-* Screen rotation handling.
-* File transfer via the local network, assuming TightVNC viewer for Windows version 1.3.x is used.
-* Password protection for secure-in-terms-of-VNC connection.
-* Ability to specify the port used.
-* Start of background service on device boot.
-* Reverse VNC.
-* Ability to connect to a UltraVNC-style Mode-2 repeater.
+## Diferencias respecto al proyecto original
 
-## Contributing
+El proyecto original requiere Android 7+ y que el usuario conceda manualmente los permisos cada vez que inicia. Esta rama resuelve ambas limitaciones:
 
-Contributions to the project are very welcome and encouraged! They can come in many forms.
-You can:
+| Componente | Cambio |
+|---|---|
+| `minSdkVersion` | Reducido de 24 a 23 (Android 6.0) |
+| Inyección de entrada | Shell `su` persistente con `input tap/swipe` para API 23, en lugar de `GestureDescription` (exclusiva de API 24+) |
+| `GestureHelper.java` | Nueva clase que aísla todo el código de API 24+ para evitar `VerifyError` en tiempo de ejecución en Android 6 |
+| Permisos de accesibilidad | Se habilitan automáticamente vía root en cada boot, sin necesidad de que el usuario entre a Ajustes |
+| Permiso de escritura en almacenamiento | Saltado automáticamente cuando se detecta acceso root |
+| Diálogo MediaProjection | Auto-aprobado por un hilo en segundo plano usando `dumpsys activity` + `uiautomator dump` con fallback a `KEYCODE_ENTER` |
+| `OnBootReceiver` | Simplificado: configura accesibilidad vía root y delega toda la lógica de permisos a `MainService` |
+| Bloqueo de pantalla | Debe estar deshabilitado (ver preparación inicial) |
+| `vnc_mouse_bridge.py` | Script Python opcional para reenviar clics del mouse del PC al dispositivo Android vía ADB |
 
-  * Submit a feature request or bug report as an [issue](https://github.com/bk138/droidVNC-NG/issues).
-  * Provide info for [issues that require feedback](https://github.com/bk138/droidVNC-NG/labels/answer-needed).
-  * Add features or fix bugs via [pull requests](https://github.com/bk138/droidVNC-NG/pulls).
-    Please note [there's a list of issues](https://github.com/bk138/droidVNC-NG/labels/help%20wanted)
-	where contributions are especially welcome. Also, please adhere to the [contribution guidelines](CONTRIBUTING.md).
+---
 
-## How to use
+## Requisitos
 
-1. Install the app from either marketplace.
-2. Get it all the permissions required.
-3. Set a good password and consider turning the `Start on Boot` off.
-4. Connect to your local Wi-Fi. For accepting a connection your device should be connected to some Local Area Network that you can control, normally it is a router. Connections via data networks (i.e. your mobile provider) are not supported.
-5. Click `Start` and connect to your device.
+- Dispositivo Android 6.0 con **acceso root** (comando `su` disponible)
+- Conexión ADB al dispositivo (USB o red)
+- Pantalla de bloqueo deshabilitada (ver preparación inicial)
+- La opción **"Iniciar al encender"** activada en los ajustes de la app (está activada por defecto)
 
-### For accepting connections from outside
+---
 
-1. You should allow [Port Forwarding](https://en.wikipedia.org/wiki/Port_forwarding) in your router's Firewall settings. Login to your router's settings (usually open 192.168.1.1 in your browser, some routers have password written on them).
-2. Find Port Forwarding, usually it's somewhere in **Network - Firewall - Port Forwards**.
-3. Create a new rule, this is an example from OpenWRT firmware.
-   
-   Name: **VNC forwarding**
-   
-   Protocol: **TCP**
-   
-   Source zone: **wan** may be "internet", "modem", something that suggests the external source.
-   
-   External port: **5900** by default or whatever you specified in the app.
-   
-   Destination zone: **lan** something that suggests local network.
-   
-   Internal IP address: your device's local IP address, leaving **any** is less secure. The device's address may change over time! You can look it up in your routers' connected clients info.
-   
-   Internal port: same as external port.
+## Preparación inicial
 
-4. Apply the settings, sometimes it requires rebooting a router.
-5. Figure out your public adress i.e. <https://www.hashemian.com/whoami/>.
-6. Use this address and port from above to connect to your device.
+Estos pasos se ejecutan una sola vez después de instalar la APK.
 
-## Notes
+### 1. Instalar la APK
 
-* Requires at least Android 7.
+Compilar desde Android Studio o con Gradle:
 
-* [Since Android 10](https://developer.android.com/about/versions/10/privacy/changes#screen-contents),
-the permission to access the screen contents has to be given on each start and is not saved. You can,
-however, work around this by installing [adb](https://developer.android.com/studio/command-line/adb)
-(or simply Android Studio) on a PC, connecting the device running droidVNC-NG to that PC and running
-`adb shell cmd appops set net.christianbeier.droidvnc_ng PROJECT_MEDIA allow` once.
+```bash
+./gradlew assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
+```
 
-* You can also use adb to manually give input permission prior to app start via `adb shell settings put secure enabled_accessibility_services net.christianbeier.droidvnc_ng/.InputService:$(adb shell settings get secure enabled_accessibility_services)`.
+### 2. Deshabilitar el bloqueo de pantalla
 
-* If you are getting a black screen in a connected VNC viewer despite having given all permissions, it
-might be that your device does not support Android's MediaProjection API correctly. To find out, you can
-try screen recording with another app, [ScreenRecorder](https://gitlab.com/vijai/screenrecorder). If it
-fails as well, your device most likely does not support screen recording via MediaProjection. This is
-known to be the case for [Android-x86](https://www.android-x86.org).
+El bloqueo de pantalla impide que el diálogo de MediaProjection aparezca en el momento del boot. Ejecutar una sola vez:
+
+```bash
+adb shell su -c "settings put secure lockscreen.disabled 1"
+adb shell su -c "settings put secure lockscreen.password_type 0"
+adb shell su -c "rm -f /data/system/password.key /data/system/gesture.key /data/system/pattern.key"
+```
+
+### 3. Habilitar el servicio de accesibilidad
+
+El servicio de accesibilidad (`InputService`) se habilita automáticamente en cada boot vía root. Para habilitarlo manualmente la primera vez:
+
+```bash
+adb shell su -c "settings put secure enabled_accessibility_services net.christianbeier.droidvnc_ng/.InputService"
+adb shell su -c "settings put secure accessibility_enabled 1"
+```
+
+### 4. Iniciar el servidor VNC manualmente (primera vez)
+
+```bash
+adb shell am startservice -n net.christianbeier.droidvnc_ng/.MainService -a start
+```
+
+A partir del siguiente reinicio, todo ocurre de forma automática.
+
+---
+
+## Flujo de arranque automático
+
+Cuando el dispositivo reinicia, la secuencia es completamente desatendida:
+
+1. **`OnBootReceiver`** recibe `BOOT_COMPLETED`, habilita el servicio de accesibilidad vía root e inicia `MainService`.
+2. **`MainService`** detecta acceso root y omite el diálogo de permisos de entrada y de escritura en almacenamiento.
+3. **`MainService`** solicita el permiso MediaProjection al sistema y lanza un hilo en segundo plano que:
+   - Despierta la pantalla (`KEYCODE_WAKEUP`)
+   - Detecta el diálogo del sistema mediante `dumpsys activity top`
+   - Obtiene las coordenadas del botón de confirmación con `uiautomator dump`
+   - Si `uiautomator` falla, presiona `KEYCODE_ENTER` como fallback
+4. El servidor VNC arranca y queda disponible para conexiones entrantes. **Sin ninguna interacción del usuario.**
+
+---
+
+## Conexión desde un cliente VNC
+
+Por defecto el servidor escucha en el puerto **5900**. Conectarse con cualquier cliente VNC compatible (RealVNC, TigerVNC, TightVNC, etc.):
+
+```
+<IP del dispositivo>:5900
+```
+
+Para obtener la IP del dispositivo:
+
+```bash
+adb shell ip route | grep wlan
+```
+
+---
+
+## Script vnc_mouse_bridge.py (opcional)
+
+Herramienta de escritorio que captura los clics del mouse sobre la ventana del visor VNC y los reenvía como toques al dispositivo Android vía ADB, sin depender del cliente VNC para la inyección de entrada.
+
+**Requisitos:**
+
+```bash
+pip install pynput pygetwindow
+```
+
+**Uso:**
+
+```bash
+python vnc_mouse_bridge.py
+```
+
+El script detecta automáticamente la ventana del visor VNC por su título, convierte las coordenadas al tamaño de pantalla del dispositivo y ejecuta `adb shell input tap X Y` para cada clic.
+
+---
+
+## Solución de problemas
+
+### Pantalla negra al conectarse por VNC
+
+- Verificar que el bloqueo de pantalla esté deshabilitado.
+- Revisar los logs del servicio para confirmar que MediaProjection fue aprobado:
+  ```bash
+  adb logcat -s MainService:D | grep -E "autoApprove|image available"
+  ```
+- Si aparece `dialog never appeared`, intentar iniciar el servicio manualmente y aprobar el diálogo desde ADB:
+  ```bash
+  adb shell su -c "input keyevent KEYCODE_WAKEUP"
+  ```
+
+### El servicio de accesibilidad no se habilita
+
+Verificar que el dispositivo tenga acceso root real:
+```bash
+adb shell su -c "id"
+# Debe mostrar: uid=0(root)
+```
+
+### El servidor no inicia en el boot
+
+Confirmar que `RECEIVE_BOOT_COMPLETED` está permitido para la app:
+```bash
+adb shell pm grant net.christianbeier.droidvnc_ng android.permission.RECEIVE_BOOT_COMPLETED
+```
+
+---
+
+## Créditos
+
+- Proyecto original: [bk138/droidVNC-NG](https://github.com/bk138/droidVNC-NG) — Christian Beier
+- Base de este fork: [EvgeniySpinov/droidVNC-NG](https://github.com/EvgeniySpinov/droidVNC-NG)
+- Soporte Android 6 + root: [alexbrtz](https://github.com/alexbrtz)
